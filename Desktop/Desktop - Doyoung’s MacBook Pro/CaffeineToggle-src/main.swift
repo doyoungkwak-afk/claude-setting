@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import ServiceManagement
-import Combine
 
 // MARK: - Icon Style
 
@@ -102,12 +101,24 @@ class WindowState: ObservableObject {
 // MARK: - AppDelegate
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var statusItem: NSStatusItem!
     private var windowController: NSWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
-        // MenuBarExtra가 완전히 설정된 후 Dock 아이콘 숨김
+        ProcessInfo.processInfo.disableAutomaticTermination("menu bar app")
+
+        // NSStatusItem 직접 생성 — MenuBarExtra 없이
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = true
+        updateIcon()
+
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+
+        // Dock 아이콘 숨김 (1초 딜레이)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             NSApp.setActivationPolicy(.accessory)
         }
@@ -116,6 +127,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         showWindow()
         return true
+    }
+
+    // MARK: NSMenuDelegate — 메뉴 열릴 때마다 재빌드
+
+    func menuWillOpen(_ menu: NSMenu) {
+        CaffeineManager.shared.refresh()
+        menu.removeAllItems()
+        buildMenu(into: menu)
+    }
+
+    func buildMenu(into menu: NSMenu) {
+        let manager = CaffeineManager.shared
+
+        let headerItem = NSMenuItem(title: manager.isActive ? "슬립 방지 켜짐" : "슬립 방지 꺼짐",
+                                    action: nil, keyEquivalent: "")
+        headerItem.isEnabled = false
+        menu.addItem(headerItem)
+        menu.addItem(.separator())
+
+        let toggleItem = NSMenuItem(
+            title: manager.isActive ? "끄기" : "켜기",
+            action: #selector(toggleCaffeine),
+            keyEquivalent: "t"
+        )
+        toggleItem.target = self
+        menu.addItem(toggleItem)
+        menu.addItem(.separator())
+
+        let openItem = NSMenuItem(title: "열기", action: #selector(openWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let settingsItem = NSMenuItem(title: "설정...", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "CaffeineToggle 종료", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        updateIcon()
+    }
+
+    // MARK: Actions
+
+    @objc func toggleCaffeine() { CaffeineManager.shared.toggle() }
+    @objc func openWindow()     { showWindow(tab: .status) }
+    @objc func openSettings()   { showWindow(tab: .general) }
+    @objc func quitApp()        { NSApp.terminate(nil) }
+
+    func updateIcon() {
+        let manager = CaffeineManager.shared
+        let iconStyleRaw = UserDefaults.standard.string(forKey: "iconStyle") ?? IconStyle.coffeeMoon.rawValue
+        let style = IconStyle(rawValue: iconStyleRaw) ?? .coffeeMoon
+        let symbolName = manager.isActive ? style.activeSymbol : style.inactiveSymbol
+        statusItem?.button?.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "CaffeineToggle")
     }
 
     func showWindow(tab: SettingsTab = .status) {
@@ -138,38 +208,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Menu Bar Content
-
-struct MenuBarContent: View {
-    @ObservedObject var manager: CaffeineManager
-    let delegate: AppDelegate
-
-    var body: some View {
-        Label(
-            manager.isActive ? "슬립 방지 켜짐" : "슬립 방지 꺼짐",
-            systemImage: manager.isActive ? "cup.and.saucer.fill" : "moon.zzz.fill"
-        )
-        .foregroundStyle(.secondary)
-
-        Divider()
-
-        Button(manager.isActive ? "끄기" : "켜기") { manager.toggle() }
-            .keyboardShortcut("t")
-
-        Divider()
-
-        Button("열기")   { delegate.showWindow(tab: .status) }
-            .keyboardShortcut("o")
-        Button("설정...") { delegate.showWindow(tab: .general) }
-            .keyboardShortcut(",")
-
-        Divider()
-
-        Button("CaffeineToggle 종료") { NSApp.terminate(nil) }
-            .keyboardShortcut("q")
-    }
-}
-
 // MARK: - Unified Window
 
 private let contentHeight: CGFloat = 380
@@ -182,7 +220,6 @@ struct UnifiedWindowView: View {
         VStack(spacing: 0) {
             tabBar
             Divider()
-            // 고정 높이 + ZStack opacity → window resize 없어서 렉 없음
             ZStack {
                 StatusTabView(manager: manager)
                     .opacity(windowState.selectedTab == .status ? 1 : 0)
@@ -326,15 +363,6 @@ struct AppearanceTabView: View {
                         Image(systemName: iconStyle.inactiveSymbol).font(.title).foregroundStyle(.indigo)
                         Text("비활성화").font(.caption).foregroundStyle(.secondary)
                     }
-                    if showMenuBarText {
-                        VStack(spacing: 6) {
-                            HStack(spacing: 4) {
-                                Image(systemName: iconStyle.activeSymbol)
-                                Text("ON").font(.system(size: 12, weight: .medium))
-                            }
-                            Text("텍스트 포함").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(14)
@@ -471,32 +499,13 @@ private func setLoginItem(enabled: Bool) {
 }
 
 // MARK: - App Entry Point
-// MenuBarExtra → SwiftUI가 NSSceneStatusItem을 올바르게 초기화 (Tahoe 필수)
-// LSUIElement in Info.plist → Dock 아이콘 숨김
-// setActivationPolicy 코드 없음 → 앱 강제 종료 버그 없음
+// MenuBarExtra 제거 → NSStatusItem 직접 사용 (macOS Tahoe 호환)
+// Settings { EmptyView() } — 앱 프로토콜 만족용 빈 씬
 
 @main
 struct CaffeineToggleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var manager = CaffeineManager.shared
-    @AppStorage("iconStyle") private var iconStyleRaw = IconStyle.coffeeMoon.rawValue
-    @AppStorage("showMenuBarText") private var showMenuBarText = false
-
-    private var iconStyle: IconStyle { IconStyle(rawValue: iconStyleRaw) ?? .coffeeMoon }
-
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarContent(manager: manager, delegate: appDelegate)
-        } label: {
-            HStack(spacing: 3) {
-                Image(systemName: manager.isActive ? iconStyle.activeSymbol : iconStyle.inactiveSymbol)
-                if showMenuBarText {
-                    Text(manager.isActive ? "ON" : "OFF")
-                        .font(.system(size: 11, weight: .medium))
-                }
-            }
-        }
-        .menuBarExtraStyle(.menu)
+        Settings { EmptyView() }
     }
 }
-
